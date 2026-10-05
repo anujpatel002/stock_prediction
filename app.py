@@ -1,580 +1,263 @@
-"""
-app.py - Stock Intelligence: ML Price Prediction Dashboard
-Interactive Streamlit application providing real-time data ingestion,
-exploratory data analysis, Random Forest regression, and next-day price estimation.
-"""
+# app.py - Stock Price Prediction Dashboard (Streamlit)
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 
 from data import POPULAR_STOCKS, load_stock_data
 from preprocessing import preprocess_and_engineer_features, FEATURE_COLUMNS
-from model import train_and_evaluate
+from model import train_and_evaluate, SUPPORTED_ALGORITHMS
 
-# Configure Streamlit Page
 st.set_page_config(
-    page_title="Stock Intelligence — ML Price Prediction",
+    page_title="Stock Price Prediction",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS for polished, academic presentation
-st.markdown(
-    """
-    <style>
-    .main-title {
-        font-size: 2.2rem;
-        font-weight: 700;
-        color: #1E293B;
-        margin-bottom: 0.2rem;
-    }
-    .sub-title {
-        font-size: 1.05rem;
-        color: #64748B;
-        margin-bottom: 1.5rem;
-    }
-    .metric-card {
-        background: #F8FAFC;
-        border: 1px solid #E2E8F0;
-        border-radius: 10px;
-        padding: 16px 20px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-    }
-    .metric-label {
-        font-size: 0.85rem;
-        color: #64748B;
-        text-transform: uppercase;
-        font-weight: 600;
-        letter-spacing: 0.5px;
-    }
-    .metric-val {
-        font-size: 1.6rem;
-        font-weight: 700;
-        color: #0F172A;
-        margin: 4px 0;
-    }
-    .metric-sub {
-        font-size: 0.85rem;
-    }
-    .change-positive {
-        color: #16A34A;
-        font-weight: 600;
-    }
-    .change-negative {
-        color: #DC2626;
-        font-weight: 600;
-    }
-    .disclaimer-box {
-        background-color: #FFFBEB;
-        border-left: 4px solid #F59E0B;
-        padding: 12px 16px;
-        border-radius: 4px;
-        font-size: 0.88rem;
-        color: #92400E;
-        margin: 15px 0 25px 0;
-    }
-    .section-header {
-        font-size: 1.3rem;
-        font-weight: 600;
-        color: #1E293B;
-        margin-top: 1.5rem;
-        margin-bottom: 0.8rem;
-        border-bottom: 2px solid #F1F5F9;
-        padding-bottom: 6px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
-
+# ── Cache data so we don't re-download on every button click ──────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_cached_stock_data(ticker: str, period: str):
-    """Caches historical data fetch to reduce redundant network overhead."""
-    return load_stock_data(ticker=ticker, period=period)
+def get_data(ticker, period):
+    return load_stock_data(ticker, period)
 
 
-# ==========================================
-# SIDEBAR CONTROLS
-# ==========================================
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 📈 Stock Prediction")
-    st.markdown("Select a stock and historical duration to train the ML model.")
-    st.markdown("---")
+    st.title("📈 Stock Prediction")
+    st.caption("Select a stock and click Run Analysis.")
+    st.divider()
 
-    stock_options = list(POPULAR_STOCKS.keys()) + ["Custom Ticker..."]
-    selected_stock_label = st.selectbox(
-        "Select Stock",
-        options=stock_options,
-        index=0,
-        help="Select a benchmark Indian NSE stock or enter a custom ticker.",
-    )
+    stock_choices = list(POPULAR_STOCKS.keys()) + ["Custom Ticker..."]
+    stock_label = st.selectbox("Stock", stock_choices)
 
-    if selected_stock_label == "Custom Ticker...":
-        selected_ticker = st.text_input(
-            "Enter Ticker (e.g. INFY.NS, AAPL)",
-            value="RELIANCE.NS",
-            help="Yahoo Finance ticker symbol",
-        ).strip().upper()
+    if stock_label == "Custom Ticker...":
+        ticker = st.text_input("Enter ticker (e.g. INFY.NS)", "RELIANCE.NS").strip().upper()
     else:
-        selected_ticker = POPULAR_STOCKS[selected_stock_label]
+        ticker = POPULAR_STOCKS[stock_label]
 
-    period_options = {
-        "5 Years": "5y",
-        "2 Years": "2y",
-        "1 Year": "1y",
-    }
-    selected_period_label = st.selectbox(
-        "Historical Period",
-        options=list(period_options.keys()),
-        index=0,
-        help="Time window for historical observations.",
-    )
-    selected_period = period_options[selected_period_label]
+    period = st.selectbox("History", {"5 Years": "5y", "2 Years": "2y", "1 Year": "1y"}.keys())
+    period_code = {"5 Years": "5y", "2 Years": "2y", "1 Year": "1y"}[period]
 
-    algo_options = {
-        "Random Forest Regressor (Ensemble Bagging)": "random_forest",
-        "Linear Regression (OLS Baseline)": "linear_regression",
-        "K-Nearest Neighbors (KNN Regressor)": "knn",
-        "Decision Tree Regressor (Single Tree)": "decision_tree",
-    }
-    selected_algo_label = st.selectbox(
-        "ML Algorithm",
-        options=list(algo_options.keys()),
-        index=0,
-        help="Select the machine learning algorithm to train and evaluate.",
-    )
-    selected_algorithm = algo_options[selected_algo_label]
+    algo_label = st.selectbox("Algorithm", list(SUPPORTED_ALGORITHMS.values()))
+    algo_key   = {v: k for k, v in SUPPORTED_ALGORITHMS.items()}[algo_label]
 
-    strategy_options = {
-        "Stationary Returns (Robust - R² > 0.95)": "stationary",
-        "Nominal Price Level (Academic Baseline)": "nominal",
-    }
-    selected_strategy_label = st.selectbox(
-        "Modeling Strategy",
-        options=list(strategy_options.keys()),
-        index=0,
-        help="Stationary Returns predicts scale-invariant returns, solving regime shifts and out-of-distribution trends.",
-    )
-    selected_mode = strategy_options[selected_strategy_label]
+    st.divider()
+    run = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
 
-    st.markdown("---")
-    run_button = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
-
-    st.markdown("---")
-    st.markdown(
-        """
-        <div style="font-size: 0.82rem; color: #64748B;">
-            <b>Project:</b> MCA ML Case Study<br>
-            <b>Model:</b> Multi-Algorithm ML Suite<br>
-            <b>Data Source:</b> Yahoo Finance API<br>
-            <b>Target:</b> Next-Day Closing Price
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# Manage state for seamless interactivity
-if "has_run" not in st.session_state:
-    st.session_state.has_run = True  # Auto-run once on launch for great first impression
-if run_button:
-    st.session_state.has_run = True
+# Auto-run once on first load
+if "ready" not in st.session_state:
+    st.session_state.ready = True
+if run:
+    st.session_state.ready = True
 
 
-# ==========================================
-# MAIN DASHBOARD CONTENT
-# ==========================================
-st.markdown('<div class="main-title">Stock Intelligence — ML Price Prediction</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="sub-title">Machine Learning Based Price Analysis & Next-Day Forecasting Dashboard</div>',
-    unsafe_allow_html=True,
+# ── Main Page ─────────────────────────────────────────────────────────────────
+st.title("Stock Price Prediction — ML Dashboard")
+st.caption("MCA / BCA Academic Case Study | Data: Yahoo Finance | Model: Scikit-Learn")
+
+if not st.session_state.ready:
+    st.info("Select a stock in the sidebar and click **Run Analysis**.")
+    st.stop()
+
+with st.spinner(f"Downloading data and training {algo_label}..."):
+    try:
+        raw_df = get_data(ticker, period_code)
+        full_df, model_df, latest_row, audit = preprocess_and_engineer_features(raw_df)
+        results = train_and_evaluate(model_df, latest_row, mode="stationary", algorithm=algo_key)
+    except Exception as err:
+        st.error(f"Error: {err}")
+        st.info("Check the ticker symbol and your internet connection.")
+        st.stop()
+
+pred    = results["prediction"]
+metrics = results["metrics"]
+
+# ── 4 Metric Cards ────────────────────────────────────────────────────────────
+c1, c2, c3, c4 = st.columns(4)
+arrow = "▲" if pred["expected_change_pct"] >= 0 else "▼"
+
+c1.metric("Current Price",       f"₹{pred['current_close']:,.2f}")
+c2.metric("Predicted Next-Day",  f"₹{pred['predicted_next_close']:,.2f}",
+          delta=f"{pred['expected_change_pct']:+.2f}%")
+c3.metric("Expected Change",
+          f"{arrow} {abs(pred['expected_change_pct']):.2f}%",
+          delta=f"₹{pred['expected_change_abs']:+,.2f}")
+c4.metric("Model R²",            f"{metrics['R2']:.4f}",
+          help=f"MAE ₹{metrics['MAE']:.2f} | RMSE ₹{metrics['RMSE']:.2f}")
+
+st.warning(
+    "⚠️ Academic project only. Predictions are NOT financial advice. "
+    "Stock markets are influenced by news, sentiment, and events no model can foresee."
 )
 
-if st.session_state.has_run:
-    with st.spinner(f"Ingesting market data for {selected_ticker} and training {selected_algo_label.split('(')[0].strip()}..."):
-        try:
-            # 1. Ingest Data
-            raw_df = get_cached_stock_data(selected_ticker, selected_period)
+# ── Historical Price Chart ────────────────────────────────────────────────────
+st.subheader("Historical Price & Moving Averages")
 
-            # 2. Preprocess & Feature Engineer
-            full_df, model_df, latest_features, audit_stats = preprocess_and_engineer_features(raw_df)
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=full_df["Date"], y=full_df["Close"],
+                         name="Close",  line=dict(color="#2563EB", width=1.8)))
+fig.add_trace(go.Scatter(x=full_df["Date"], y=full_df["MA_5"],
+                         name="MA 5",   line=dict(color="#10B981", width=1.4, dash="dot")))
+fig.add_trace(go.Scatter(x=full_df["Date"], y=full_df["MA_20"],
+                         name="MA 20",  line=dict(color="#F59E0B", width=1.5, dash="dash")))
+fig.update_layout(
+    title=f"{ticker} — Closing Price with Moving Averages",
+    xaxis_title="Date", yaxis_title="Price (₹)",
+    template="plotly_white", height=420, hovermode="x unified",
+    xaxis=dict(rangeslider=dict(visible=True)),
+    legend=dict(orientation="h", y=1.05, x=1, xanchor="right"),
+    margin=dict(l=40, r=40, t=55, b=40),
+)
+st.plotly_chart(fig, use_container_width=True)
 
-            # 3. Train Model and Generate Predictions
-            results = train_and_evaluate(
-                model_df,
-                latest_features,
-                mode=selected_mode,
-                algorithm=selected_algorithm,
-            )
+# ── Actual vs Predicted  +  Feature Importance ───────────────────────────────
+col_left, col_right = st.columns(2)
 
-        except Exception as e:
-            st.error(f"Error during analysis: {str(e)}")
-            st.info("Tip: Verify the ticker symbol (e.g., RELIANCE.NS) and ensure your internet connection is active.")
-            st.stop()
+with col_left:
+    st.subheader("Actual vs Predicted (Test Set)")
+    tdf = results["test_results_df"]
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=tdf["Date"], y=tdf["Actual_Price"],
+                              name="Actual",    line=dict(color="#0F172A", width=1.8)))
+    fig2.add_trace(go.Scatter(x=tdf["Date"], y=tdf["Predicted_Price"],
+                              name="Predicted", line=dict(color="#E11D48", width=1.5, dash="dash")))
+    fig2.update_layout(
+        title=f"Out-of-Sample Test ({results['test_size']} days)",
+        xaxis_title="Date", yaxis_title="Price (₹)",
+        template="plotly_white", height=340, hovermode="x unified",
+        legend=dict(orientation="h", y=1.05, x=1, xanchor="right"),
+        margin=dict(l=40, r=40, t=50, b=40),
+    )
+    st.plotly_chart(fig2, use_container_width=True)
 
-    pred_info = results["prediction"]
-    metrics = results["metrics"]
-    test_results_df = results["test_results_df"]
-    feature_importance_df = results["feature_importance_df"]
+with col_right:
+    st.subheader(f"Feature Importance — {results['algorithm_name']}")
+    fidf = results["feature_importance_df"]
+    fig3 = px.bar(fidf, x="Importance", y="Feature", orientation="h",
+                  text=fidf["Importance"].map(lambda v: f"{v*100:.1f}%"),
+                  color="Importance", color_continuous_scale="Blues")
+    fig3.update_layout(
+        template="plotly_white", height=340,
+        xaxis_title="Relative Importance", yaxis_title="",
+        coloraxis_showscale=False,
+        margin=dict(l=40, r=40, t=20, b=40),
+    )
+    fig3.update_traces(textposition="outside")
+    st.plotly_chart(fig3, use_container_width=True)
+    st.caption("Higher bar = feature contributed more to the model's decisions.")
 
-    current_price = pred_info["current_close"]
-    predicted_price = pred_info["predicted_next_close"]
-    expected_change = pred_info["expected_change_pct"]
-    r2_score_val = metrics["R2"]
+# ── Prediction Summary  +  Recent Data ───────────────────────────────────────
+col_a, col_b = st.columns(2)
 
-    # Recent IPO / Limited History Notice
-    if audit_stats["initial_rows"] < 60:
-        st.info(
-            f"ℹ️ **Recent Listing (IPO) Notice:** `{selected_ticker}` has only **{audit_stats['initial_rows']} trading days** "
-            "of total recorded history. Machine learning models require sufficient historical market cycles; "
-            "predictions for newly listed equities reflect initial price discovery and should be interpreted with caution."
-        )
+with col_a:
+    st.subheader("Next-Day Prediction Summary")
+    with st.container(border=True):
+        st.markdown(f"**Stock:** `{ticker}`  |  **Reference date:** {pred['last_date'].strftime('%d %b %Y')}")
+        st.table(pd.DataFrame({
+            "Metric": ["Current Close", "Predicted Next Close", "Change", "Signal"],
+            "Value":  [
+                f"₹{pred['current_close']:,.2f}",
+                f"₹{pred['predicted_next_close']:,.2f}",
+                f"{arrow} {abs(pred['expected_change_pct']):.2f}%  (₹{pred['expected_change_abs']:+,.2f})",
+                "Bullish 📈" if pred["expected_change_pct"] >= 0 else "Bearish 📉",
+            ],
+        }).set_index("Metric"))
 
-    # ==========================================
-    # 4 METRIC CARDS (Native Streamlit)
-    # ==========================================
-    col1, col2, col3, col4 = st.columns(4)
-
-    change_arrow = "▲" if expected_change >= 0 else "▼"
-
-    with col1:
-        st.metric(
-            label="Current Price",
-            value=f"₹{current_price:,.2f}",
-            help=f"Latest Close ({pred_info['last_date'].strftime('%d %b %Y')})",
-        )
-
-    with col2:
-        st.metric(
-            label="Predicted Next-Day",
-            value=f"₹{predicted_price:,.2f}",
-            delta=f"{expected_change:+.2f}%",
-            help=f"{results['algorithm_name']} next-day closing price estimate",
-        )
-
-    with col3:
-        st.metric(
-            label="Expected Change",
-            value=f"{change_arrow} {abs(expected_change):.2f}%",
-            delta=f"₹{pred_info['expected_change_abs']:+,.2f}",
-            delta_color="normal",
-            help="Difference between predicted next close and current close",
-        )
-
-    with col4:
-        st.metric(
-            label="Model R² Score",
-            value=f"{r2_score_val:.4f}",
-            help=f"MAE: ₹{metrics['MAE']:.2f} | RMSE: ₹{metrics['RMSE']:.2f}",
-        )
-
-    # Educational Disclaimer
-    st.warning(
-        "⚠️ **Academic Disclaimer:** This application is an educational predictive modeling demonstration. "
-        "Financial markets are non-stationary and influenced by macroeconomic factors, unforeseen news, and investor sentiment. "
-        "**Model-estimated next-day closing prices** do not constitute financial advice or guaranteed investment outcomes."
+with col_b:
+    st.subheader("Recent Market Data (Last 15 Days)")
+    recent = full_df.tail(15)[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
+    recent["Date"] = recent["Date"].dt.strftime("%Y-%m-%d")
+    st.dataframe(
+        recent.sort_values("Date", ascending=False).style.format({
+            "Open": "₹{:,.2f}", "High": "₹{:,.2f}",
+            "Low":  "₹{:,.2f}", "Close": "₹{:,.2f}",
+            "Volume": "{:,.0f}",
+        }),
+        use_container_width=True, height=340,
     )
 
-    # ==========================================
-    # HISTORICAL PRICE & MOVING AVERAGES CHART
-    # ==========================================
-    st.subheader("Historical Price & Moving Averages")
+# ── EDA Section ───────────────────────────────────────────────────────────────
+with st.expander("📊 Exploratory Data Analysis (EDA) — Click to expand"):
+    e1, e2 = st.columns(2)
 
-    fig_price = go.Figure()
-    fig_price.add_trace(
-        go.Scatter(
-            x=full_df["Date"],
-            y=full_df["Close"],
-            mode="lines",
-            name="Closing Price",
-            line=dict(color="#2563EB", width=1.8),
-            hovertemplate="<b>Date:</b> %{x|%Y-%m-%d}<br><b>Close:</b> ₹%{y:,.2f}<extra></extra>",
-        )
-    )
-    fig_price.add_trace(
-        go.Scatter(
-            x=full_df["Date"],
-            y=full_df["MA_5"],
-            mode="lines",
-            name="5-Day Moving Average (MA_5)",
-            line=dict(color="#10B981", width=1.4, dash="dot"),
-            hovertemplate="<b>MA_5:</b> ₹%{y:,.2f}<extra></extra>",
-        )
-    )
-    fig_price.add_trace(
-        go.Scatter(
-            x=full_df["Date"],
-            y=full_df["MA_20"],
-            mode="lines",
-            name="20-Day Moving Average (MA_20)",
-            line=dict(color="#F59E0B", width=1.5, dash="dash"),
-            hovertemplate="<b>MA_20:</b> ₹%{y:,.2f}<extra></extra>",
-        )
-    )
-    fig_price.update_layout(
-        title=f"{selected_ticker} — Historical Closing Price with Technical Moving Averages",
-        xaxis_title="Trading Date",
-        yaxis_title="Price (₹ INR)",
-        template="plotly_white",
-        height=450,
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis=dict(
-            rangeslider=dict(visible=True),
-            type="date",
-        ),
-        margin=dict(l=40, r=40, t=60, b=40),
-    )
-    st.plotly_chart(fig_price, use_container_width=True)
-
-    # ==========================================
-    # PREDICTION & MODEL PERFORMANCE (2 COLUMNS)
-    # ==========================================
-    col_left, col_right = st.columns([1, 1])
-
-    with col_left:
-        st.subheader("Next Trading Day Prediction")
-        
-        with st.container(border=True):
-            st.markdown(f"**Target Stock:** `{selected_ticker}`")
-            st.caption(f"**Reference Date:** {pred_info['last_date'].strftime('%A, %d %B %Y')}")
-            
-            # Real Native Streamlit Table
-            prediction_table = pd.DataFrame(
-                {
-                    "Metric": [
-                        "Current Close",
-                        "Predicted Next Close",
-                        "Predicted Change",
-                        "Prediction Category",
-                    ],
-                    "Value": [
-                        f"₹{current_price:,.2f}",
-                        f"₹{predicted_price:,.2f}",
-                        f"{change_arrow} {abs(expected_change):.2f}% (₹{pred_info['expected_change_abs']:+,.2f})",
-                        "Bullish Momentum" if expected_change >= 0 else "Bearish Pressure",
-                    ],
-                }
-            )
-            st.table(prediction_table.set_index("Metric"))
-            
-            st.caption("ℹ️ *The prediction is generated using 7 lag, momentum, volatility, and volume indicators.*")
-
-    with col_right:
-        st.subheader("Model Performance — Actual vs Predicted")
-        
-        fig_test = go.Figure()
-        fig_test.add_trace(
-            go.Scatter(
-                x=test_results_df["Date"],
-                y=test_results_df["Actual_Price"],
-                mode="lines",
-                name="Actual Test Price",
-                line=dict(color="#0F172A", width=1.8),
-                hovertemplate="Actual: ₹%{y:,.2f}<extra></extra>",
-            )
-        )
-        fig_test.add_trace(
-            go.Scatter(
-                x=test_results_df["Date"],
-                y=test_results_df["Predicted_Price"],
-                mode="lines",
-                name="Predicted Price",
-                line=dict(color="#E11D48", width=1.5, dash="dash"),
-                hovertemplate="Predicted: ₹%{y:,.2f}<extra></extra>",
-            )
-        )
-        fig_test.update_layout(
-            title=f"Out-of-Sample Test Evaluation ({results['test_size']} Trading Days)",
-            xaxis_title="Trading Date",
-            yaxis_title="Price (₹ INR)",
-            template="plotly_white",
-            height=300,
-            hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=40, r=40, t=50, b=40),
-        )
-        st.plotly_chart(fig_test, use_container_width=True)
-
-    # ==========================================
-    # FEATURE IMPORTANCE & RECENT DATA (2 COLUMNS)
-    # ==========================================
-    col_feat, col_data = st.columns([1, 1])
-
-    with col_feat:
-        st.subheader(f"Feature Importance ({results['algorithm_name']})")
-        
-        fig_feat = px.bar(
-            feature_importance_df,
-            x="Importance",
-            y="Feature",
-            orientation="h",
-            text=feature_importance_df["Importance"].apply(lambda v: f"{v*100:.1f}%"),
-            color="Importance",
-            color_continuous_scale="Blues",
-        )
-        fig_feat.update_layout(
-            template="plotly_white",
-            height=350,
-            xaxis_title="Relative Gini Importance",
-            yaxis_title="Engineered Feature",
-            coloraxis_showscale=False,
-            margin=dict(l=40, r=40, t=20, b=40),
-        )
-        fig_feat.update_traces(textposition="outside")
-        st.plotly_chart(fig_feat, use_container_width=True)
-        
-        st.caption(
-            "📌 **Academic Note:** Feature importance measures the variance reduction contribution "
-            "of each feature across all decision trees. It represents *predictive contribution* within "
-            "the trained model and does not establish economic or causal relationship."
-        )
-
-    with col_data:
-        st.subheader("Recent Market Data (Latest Records)")
-        
-        recent_display_df = full_df.tail(15)[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
-        recent_display_df["Date"] = recent_display_df["Date"].dt.strftime("%Y-%m-%d")
-        
-        # Format columns for presentation
-        st.dataframe(
-            recent_display_df.sort_values("Date", ascending=False).style.format(
-                {
-                    "Open": "₹{:,.2f}",
-                    "High": "₹{:,.2f}",
-                    "Low": "₹{:,.2f}",
-                    "Close": "₹{:,.2f}",
-                    "Volume": "{:,.0f}",
-                }
-            ),
+    with e1:
+        st.markdown("**Chart 1: Closing Price Trend**")
+        st.plotly_chart(
+            px.line(full_df, x="Date", y="Close",
+                    title=f"{ticker} — Price History",
+                    labels={"Close": "Price (₹)"},
+                    template="plotly_white", height=300),
             use_container_width=True,
-            height=340,
         )
 
-    # ==========================================
-    # EXPANDABLE EDA SECTION
-    # ==========================================
-    with st.expander("📊 Exploratory Data Analysis (EDA) — Click to Expand"):
-        st.markdown("### Exploratory Data Analysis of Historical Series")
-        st.markdown(
-            "EDA provides foundational insights into trend, volatility, liquidity, "
-            "and cross-correlations before feeding features into the regression pipeline."
+    with e2:
+        st.markdown("**Chart 2: Daily Trading Volume**")
+        st.plotly_chart(
+            px.bar(full_df, x="Date", y="Volume",
+                   title=f"{ticker} — Volume",
+                   labels={"Volume": "Shares Traded"},
+                   template="plotly_white", height=300,
+                   color_discrete_sequence=["#94A3B8"]),
+            use_container_width=True,
         )
 
-        eda_c1, eda_c2 = st.columns(2)
+    e3, e4 = st.columns(2)
 
-        with eda_c1:
-            st.markdown("#### Chart 1: Historical Closing Price Trend")
-            fig_eda1 = px.line(
-                full_df,
-                x="Date",
-                y="Close",
-                title=f"{selected_ticker} — Closing Price Trajectory",
-                labels={"Close": "Closing Price (₹)", "Date": "Date"},
-            )
-            fig_eda1.update_traces(line_color="#2563EB")
-            fig_eda1.update_layout(template="plotly_white", height=320, margin=dict(l=30, r=30, t=40, b=30))
-            st.plotly_chart(fig_eda1, use_container_width=True)
+    with e3:
+        st.markdown("**Chart 3: MA_5 vs MA_20 Crossover**")
+        fig_ma = go.Figure()
+        fig_ma.add_trace(go.Scatter(x=full_df["Date"], y=full_df["MA_5"],
+                                    name="MA 5 (fast)",  line=dict(color="#10B981")))
+        fig_ma.add_trace(go.Scatter(x=full_df["Date"], y=full_df["MA_20"],
+                                    name="MA 20 (slow)", line=dict(color="#F59E0B")))
+        fig_ma.update_layout(title="Moving Average Crossover",
+                             template="plotly_white", height=300,
+                             xaxis_title="Date", yaxis_title="Price (₹)",
+                             margin=dict(l=30, r=30, t=40, b=30))
+        st.plotly_chart(fig_ma, use_container_width=True)
 
-        with eda_c2:
-            st.markdown("#### Chart 2: Daily Trading Volume Distribution")
-            fig_eda2 = px.bar(
-                full_df,
-                x="Date",
-                y="Volume",
-                title=f"{selected_ticker} — Daily Market Trading Volume",
-                labels={"Volume": "Volume (Shares)", "Date": "Date"},
-            )
-            fig_eda2.update_traces(marker_color="#94A3B8")
-            fig_eda2.update_layout(template="plotly_white", height=320, margin=dict(l=30, r=30, t=40, b=30))
-            st.plotly_chart(fig_eda2, use_container_width=True)
-
-        eda_c3, eda_c4 = st.columns(2)
-
-        with eda_c3:
-            st.markdown("#### Chart 3: Short vs Medium Moving Averages")
-            fig_eda3 = go.Figure()
-            fig_eda3.add_trace(go.Scatter(x=full_df["Date"], y=full_df["MA_5"], name="MA_5 (Fast)", line=dict(color="#10B981")))
-            fig_eda3.add_trace(go.Scatter(x=full_df["Date"], y=full_df["MA_20"], name="MA_20 (Slow)", line=dict(color="#F59E0B")))
-            fig_eda3.update_layout(
-                title="MA_5 vs MA_20 Trend Crossover Analysis",
-                template="plotly_white",
-                height=320,
-                xaxis_title="Date",
-                yaxis_title="Price (₹)",
-                margin=dict(l=30, r=30, t=40, b=30),
-            )
-            st.plotly_chart(fig_eda3, use_container_width=True)
-
-        with eda_c4:
-            st.markdown("#### Chart 4: Feature Correlation Heatmap")
-            corr_cols = [c for c in FEATURE_COLUMNS if c in full_df.columns] + ["Close"]
-            corr_matrix = full_df[corr_cols].corr()
-
-            fig_corr = px.imshow(
-                corr_matrix,
-                text_auto=".2f",
-                aspect="auto",
-                color_continuous_scale="RdBu_r",
-                title="Pearson Correlation Matrix (Features vs Close)",
-            )
-            fig_corr.update_layout(template="plotly_white", height=320, margin=dict(l=30, r=30, t=40, b=30))
-            st.plotly_chart(fig_corr, use_container_width=True)
-
-    # ==========================================
-    # MODEL SPECIFICATIONS & AUDIT SUMMARY
-    # ==========================================
-    st.subheader("Model Information & Pipeline Architecture")
-
-    m_col1, m_col2, m_col3 = st.columns(3)
-
-    with m_col1:
-        st.markdown(
-            f"""
-            **Algorithm Configuration**
-            - **Model:** `{results['algorithm_name']}`
-            - **Strategy:** `{'Stationary Returns' if results['mode'] == 'stationary' else 'Nominal Price Level'}`
-            - **Split Ratio:** 80% Train / 20% Test
-            - **Random State:** 42 (Reproducible)
-            - **Criterion:** Squared Error Loss
-            """
+    with e4:
+        st.markdown("**Chart 4: Feature Correlation Heatmap**")
+        corr_cols = [c for c in FEATURE_COLUMNS if c in full_df.columns] + ["Close"]
+        fig_corr = px.imshow(
+            full_df[corr_cols].corr(),
+            text_auto=".2f", aspect="auto",
+            color_continuous_scale="RdBu_r",
+            title="Pearson Correlation Matrix",
+            height=300,
         )
+        fig_corr.update_layout(template="plotly_white", margin=dict(l=30, r=30, t=40, b=30))
+        st.plotly_chart(fig_corr, use_container_width=True)
 
-    with m_col2:
-        st.markdown(
-            f"""
-            **Dataset & Split Strategy**
-            - **Split Type:** Chronological (Time-Series)
-            - **Training Ratio:** 80% ({results['train_size']} records)
-            - **Testing Ratio:** 20% ({results['test_size']} records)
-            - **Lookahead Leakage:** Strictly Prevented
-            - **Engineered Features:** 7 Lag/Momentum features
-            """
-        )
+# ── Model Info ────────────────────────────────────────────────────────────────
+st.subheader("Model & Pipeline Summary")
+i1, i2, i3 = st.columns(3)
 
-    with m_col3:
-        st.markdown(
-            f"""
-            **Calculated Evaluation Metrics**
-            - **Mean Absolute Error (MAE):** ₹{metrics['MAE']:.2f}
-            - **Root Mean Squared Error (RMSE):** ₹{metrics['RMSE']:.2f}
-            - **Coefficient of Determination ($R^2$):** {metrics['R2']:.4f}
-            - **Audit:** Dropped {audit_stats['warmup_rows_dropped']} rolling warm-up records
-            """
-        )
+i1.markdown(f"""
+**Algorithm**
+- Model: `{results['algorithm_name']}`
+- Strategy: `Stationary Returns`
+- Split: 80% train / 20% test
+- Random seed: 42
+""")
 
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        """
-        <div style="text-align: center; color: #94A3B8; font-size: 0.85rem; padding: 10px 0;">
-            <b>Stock Price Prediction — 10-Mark MCA Academic Case Study Mini-App</b> |
-            Developed with Python, Streamlit, Scikit-learn, and Yahoo Finance Data.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+i2.markdown(f"""
+**Dataset**
+- Total usable rows: {results['train_size'] + results['test_size']}
+- Training rows: {results['train_size']}
+- Test rows: {results['test_size']}
+- Split type: Chronological (no shuffle)
+""")
+
+i3.markdown(f"""
+**Evaluation (on test set)**
+- MAE:  ₹{metrics['MAE']:.2f}
+- RMSE: ₹{metrics['RMSE']:.2f}
+- R²:   {metrics['R2']:.4f}
+- Warm-up rows dropped: {audit['warmup_rows_dropped']}
+""")
+
+st.divider()
+st.caption("Stock Price Prediction — MCA Academic Case Study | Python · Streamlit · Scikit-Learn · Yahoo Finance")

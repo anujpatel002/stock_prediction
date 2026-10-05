@@ -1,28 +1,14 @@
-"""
-model.py - Machine Learning Model Training, Prediction, and Evaluation
-Supports all applicable Scikit-Learn regression algorithms:
-  - Random Forest Regressor (Ensemble Bagging)
-  - Gradient Boosting Regressor (Ensemble Boosting)
-  - Decision Tree Regressor (Single Tree)
-  - Linear Regression (Ordinary Least Squares Baseline)
-  - Ridge Regression (L2 Regularized)
-  - Support Vector Regressor (SVR - RBF Kernel)
-  - K-Nearest Neighbors (KNN Regressor)
-Also supports both Stationary Returns and Nominal Price modeling strategies.
-"""
+# model.py - Train a machine learning model and predict tomorrow's stock price
 
-from typing import Dict, Any, List
 import numpy as np
 import pandas as pd
 
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.tree import DecisionTreeRegressor
-from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.svm import SVR
+from sklearn.linear_model import LinearRegression
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 from preprocessing import (
@@ -32,238 +18,183 @@ from preprocessing import (
     TARGET_RETURN_COLUMN,
 )
 
-SUPPORTED_ALGORITHMS: Dict[str, str] = {
-    "random_forest": "Random Forest Regressor",
-    "linear_regression": "Linear Regression (OLS)",
-    "knn": "K-Nearest Neighbors (KNN)",
-    "decision_tree": "Decision Tree Regressor",
+# Human-readable names shown in the UI dropdown
+SUPPORTED_ALGORITHMS = {
+    "random_forest":    "Random Forest Regressor",
+    "linear_regression":"Linear Regression (OLS)",
+    "knn":              "K-Nearest Neighbors (KNN)",
+    "decision_tree":    "Decision Tree Regressor",
+}
+
+# Readable labels for the feature importance chart
+FEATURE_LABELS = {
+    "Previous_Close":  "Previous Close",
+    "Daily_Return":    "Daily Return",
+    "MA_5":            "5-Day Moving Avg",
+    "MA_20":           "20-Day Moving Avg",
+    "High_Low_Range":  "High-Low Range",
+    "Volume_Change":   "Volume Change",
+    "Volatility":      "10-Day Volatility",
+    "Ratio_MA5":       "5-Day MA Ratio",
+    "Ratio_MA20":      "20-Day MA Ratio",
+    "Rel_High_Low":    "Intraday Spread Ratio",
 }
 
 
-def _instantiate_model(algorithm_key: str, random_state: int = 42):
-    """Factory function to build the requested algorithm pipeline."""
-    key = algorithm_key.lower().strip()
+def _build_model(algorithm: str, seed: int = 42):
+    """
+    Return the right scikit-learn model object for the chosen algorithm.
+    Linear models and KNN need StandardScaler, so we wrap them in a Pipeline.
+    """
+    # Models that need feature scaling
+    scaled = {
+        "linear_regression": LinearRegression(),
+        "knn":               KNeighborsRegressor(n_neighbors=5),
+    }
+    # Tree-based models — no scaling needed
+    trees = {
+        "random_forest": RandomForestRegressor(n_estimators=200, random_state=seed, n_jobs=-1),
+        "decision_tree": DecisionTreeRegressor(max_depth=6, random_state=seed),
+    }
 
-    if key == "random_forest":
-        return RandomForestRegressor(
-            n_estimators=200,
-            random_state=random_state,
-            n_jobs=-1,
-        )
-    elif key == "gradient_boosting":
-        return GradientBoostingRegressor(
-            n_estimators=150,
-            learning_rate=0.05,
-            random_state=random_state,
-        )
-    elif key == "decision_tree":
-        return DecisionTreeRegressor(
-            max_depth=6,
-            random_state=random_state,
-        )
-    elif key == "linear_regression":
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("reg", LinearRegression()),
-            ]
-        )
-    elif key == "ridge":
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("reg", Ridge(alpha=1.0)),
-            ]
-        )
-    elif key == "svr":
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("reg", SVR(C=1.0, epsilon=0.01)),
-            ]
-        )
-    elif key == "knn":
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("reg", KNeighborsRegressor(n_neighbors=5)),
-            ]
-        )
+    key = algorithm.lower().strip()
+
+    if key in scaled:
+        return Pipeline([("scaler", StandardScaler()), ("reg", scaled[key])])
+    if key in trees:
+        return trees[key]
+
+    # Default fallback
+    return trees["random_forest"]
+
+
+def _get_importances(model, feature_cols: list) -> np.ndarray:
+    """
+    Get how important each feature was for the model's predictions.
+    - Tree models have a built-in .feature_importances_ attribute.
+    - Linear models use the size of their coefficients.
+    - Returns a normalized array (values add up to 1.0).
+    """
+    # Tree models (Random Forest, Decision Tree)
+    if hasattr(model, "feature_importances_"):
+        raw = model.feature_importances_
+
+    # Linear models inside a Pipeline
+    elif hasattr(model, "named_steps") and hasattr(model.named_steps["reg"], "coef_"):
+        raw = np.abs(model.named_steps["reg"].coef_)
+
+    # KNN has no built-in importance — give every feature equal weight
     else:
-        # Default fallback to Random Forest
-        return RandomForestRegressor(
-            n_estimators=200,
-            random_state=random_state,
-            n_jobs=-1,
-        )
-
-
-def _extract_feature_importances(model, X_test, y_test, feature_cols: List[str]) -> np.ndarray:
-    """Extracts or estimates normalized feature importance for any regressor."""
-    try:
-        # 1. Direct Gini importance (Random Forest, Gradient Boosting, Decision Tree)
-        if hasattr(model, "feature_importances_"):
-            raw = np.array(model.feature_importances_)
-            total = raw.sum()
-            return raw / total if total > 0 else np.ones(len(raw)) / len(raw)
-
-        # 2. Linear / Ridge coefficients from pipeline
-        if hasattr(model, "named_steps") and hasattr(model.named_steps["reg"], "coef_"):
-            raw = np.abs(model.named_steps["reg"].coef_)
-            total = raw.sum()
-            return raw / total if total > 0 else np.ones(len(raw)) / len(raw)
-
-        # 3. Model-agnostic Permutation Importance (SVR, KNN)
-        perm = permutation_importance(model, X_test, y_test, n_repeats=5, random_state=42)
-        raw = np.maximum(0, perm.importances_mean)
-        total = raw.sum()
-        if total > 0:
-            return raw / total
         return np.ones(len(feature_cols)) / len(feature_cols)
 
-    except Exception:
-        return np.ones(len(feature_cols)) / len(feature_cols)
+    total = raw.sum()
+    return raw / total if total > 0 else np.ones(len(raw)) / len(raw)
 
 
 def train_and_evaluate(
-    model_df: pd.DataFrame,
-    latest_features: pd.DataFrame,
+    model_df,
+    latest_features,
     mode: str = "stationary",
     algorithm: str = "random_forest",
     train_ratio: float = 0.80,
     random_state: int = 42,
-) -> Dict[str, Any]:
+) -> dict:
     """
-    Trains the selected ML regression algorithm on chronological historical stock data
-    and generates evaluation metrics along with next-trading-day predictions.
+    Train the model on historical data and predict tomorrow's closing price.
 
-    Parameters:
-        model_df (pd.DataFrame): Preprocessed dataframe with features and targets.
-        latest_features (pd.DataFrame): Most recent single row of features.
-        mode (str): 'stationary' (relative percentage returns) or 'nominal' (absolute price level).
-        algorithm (str): Key identifying the ML algorithm from SUPPORTED_ALGORITHMS.
-        train_ratio (float): Chronological train split ratio (default 0.80).
-        random_state (int): Reproducibility seed.
+    model_df        — cleaned DataFrame with features + target columns
+    latest_features — the most recent row (used to predict tomorrow)
+    mode            — 'stationary' (predict % return) or 'nominal' (predict raw price)
+    algorithm       — which ML algorithm to use
+    train_ratio     — fraction of data used for training (0.80 = 80%)
 
-    Returns:
-        dict: Containing model, metrics, test evaluation dataframe,
-              feature importances, and next-day forecast.
+    Returns a dict with metrics, test results, feature importances, and the prediction.
     """
-    total_samples = len(model_df)
-    if total_samples < 20:
+    if len(model_df) < 20:
         raise ValueError(
-            f"Insufficient samples ({total_samples}) for reliable time-series modeling. "
-            "The stock may be very newly listed with fewer than 20 trading sessions. "
-            "Please select an equity with at least 1 month of trading history."
+            f"Only {len(model_df)} rows available. Need at least 20 trading days of data."
         )
 
-    # 1. Select Features and Target based on Modeling Strategy
+    # Pick features and target column based on mode
     if mode == "stationary":
-        feature_cols = STATIONARY_FEATURE_COLUMNS
-        target_col = TARGET_RETURN_COLUMN
+        features = STATIONARY_FEATURE_COLUMNS
+        target   = TARGET_RETURN_COLUMN
     else:
-        feature_cols = NOMINAL_FEATURE_COLUMNS
-        target_col = TARGET_PRICE_COLUMN
+        features = NOMINAL_FEATURE_COLUMNS
+        target   = TARGET_PRICE_COLUMN
 
-    # 2. Chronological Train/Test Split (Strictly NO random shuffling)
-    split_index = int(total_samples * train_ratio)
-    train_df = model_df.iloc[:split_index].copy()
-    test_df = model_df.iloc[split_index:].copy()
+    # --- Chronological 80/20 split (NO shuffling — future data must not leak into training) ---
+    split = int(len(model_df) * train_ratio)
+    train = model_df.iloc[:split]
+    test  = model_df.iloc[split:]
 
-    X_train = train_df[feature_cols]
-    y_train = train_df[target_col]
+    X_train, y_train = train[features], train[target]
+    X_test,  y_test  = test[features],  test[target]
+    actual_prices    = test[TARGET_PRICE_COLUMN]   # always compare in ₹
 
-    X_test = test_df[feature_cols]
-    y_test = test_df[target_col]
-    y_test_price = test_df[TARGET_PRICE_COLUMN]
-
-    # 3. Model Initialization and Training
-    model = _instantiate_model(algorithm, random_state=random_state)
+    # --- Train ---
+    model = _build_model(algorithm, seed=random_state)
     model.fit(X_train, y_train)
 
-    # 4. Model Inference & Price Reconstruction
+    # --- Predict on test set ---
     if mode == "stationary":
-        test_pred_returns = model.predict(X_test)
-        test_predictions = test_df["Close"].values * (1.0 + test_pred_returns)
+        # Model predicts % return → convert back to price
+        pred_returns   = model.predict(X_test)
+        test_preds     = test["Close"].values * (1.0 + pred_returns)
     else:
-        test_predictions = model.predict(X_test)
+        test_preds = model.predict(X_test)
 
-    # 5. Evaluation Metrics Calculation
-    mae = float(mean_absolute_error(y_test_price, test_predictions))
-    mse = float(mean_squared_error(y_test_price, test_predictions))
-    rmse = float(np.sqrt(mse))
-    r2 = float(r2_score(y_test_price, test_predictions))
+    # --- Evaluation metrics ---
+    mae  = float(mean_absolute_error(actual_prices, test_preds))
+    rmse = float(np.sqrt(mean_squared_error(actual_prices, test_preds)))
+    r2   = float(r2_score(actual_prices, test_preds))
 
-    # 6. Build Test Results DataFrame
-    test_results_df = pd.DataFrame(
-        {
-            "Date": test_df["Date"].values,
-            "Actual_Price": y_test_price.values,
-            "Predicted_Price": test_predictions,
-            "Residual": y_test_price.values - test_predictions,
-        }
-    )
+    # --- Test results table (for the Actual vs Predicted chart) ---
+    test_results_df = pd.DataFrame({
+        "Date":            test["Date"].values,
+        "Actual_Price":    actual_prices.values,
+        "Predicted_Price": test_preds,
+        "Residual":        actual_prices.values - test_preds,
+    })
 
-    # 7. Feature Importance Extraction
-    readable_names = {
-        "Daily_Return": "Daily Return",
-        "Ratio_MA5": "5-Day MA Ratio",
-        "Ratio_MA20": "20-Day MA Ratio",
-        "Rel_High_Low": "Intraday Spread Ratio",
-        "Volume_Change": "Volume Change",
-        "Volatility": "10-Day Volatility",
-        "Previous_Close": "Previous Close",
-        "MA_5": "5-Day Moving Avg",
-        "MA_20": "20-Day Moving Avg",
-        "High_Low_Range": "High-Low Range",
-    }
-    feature_labels = [readable_names.get(col, col) for col in feature_cols]
-    importances = _extract_feature_importances(model, X_test, y_test, feature_cols)
+    # --- Feature importance ---
+    importances = _get_importances(model, features)
+    feature_importance_df = pd.DataFrame({
+        "Feature":    [FEATURE_LABELS.get(f, f) for f in features],
+        "Raw_Feature": features,
+        "Importance":  importances,
+    }).sort_values("Importance", ascending=True)
 
-    feature_importance_df = pd.DataFrame(
-        {
-            "Feature": feature_labels,
-            "Raw_Feature": feature_cols,
-            "Importance": importances,
-        }
-    ).sort_values("Importance", ascending=True)
-
-    # 8. Next Trading Day Prediction
-    latest_X = latest_features[feature_cols]
+    # --- Predict tomorrow ---
+    latest_X      = latest_features[features]
     current_close = float(latest_features["Close"].values[0])
-    last_trading_date = pd.to_datetime(latest_features["Date"].values[0])
+    last_date     = pd.to_datetime(latest_features["Date"].values[0])
 
     if mode == "stationary":
-        next_pred_return = float(model.predict(latest_X)[0])
-        predicted_next_close = float(current_close * (1.0 + next_pred_return))
-        expected_change_pct = next_pred_return * 100.0
-        expected_change_abs = predicted_next_close - current_close
+        pred_return        = float(model.predict(latest_X)[0])
+        predicted_price    = current_close * (1.0 + pred_return)
+        change_pct         = pred_return * 100.0
     else:
-        predicted_next_close = float(model.predict(latest_X)[0])
-        expected_change_abs = predicted_next_close - current_close
-        expected_change_pct = (expected_change_abs / current_close) * 100.0
+        predicted_price    = float(model.predict(latest_X)[0])
+        change_pct         = (predicted_price - current_close) / current_close * 100.0
 
-    algo_display_name = SUPPORTED_ALGORITHMS.get(algorithm.lower().strip(), "Machine Learning Regressor")
+    change_abs = predicted_price - current_close
 
     return {
-        "model": model,
-        "algorithm_key": algorithm,
-        "algorithm_name": algo_display_name,
-        "mode": mode,
-        "train_size": len(train_df),
-        "test_size": len(test_df),
-        "metrics": {
-            "MAE": mae,
-            "RMSE": rmse,
-            "R2": r2,
-        },
-        "test_results_df": test_results_df,
+        "model":                model,
+        "algorithm_key":        algorithm,
+        "algorithm_name":       SUPPORTED_ALGORITHMS.get(algorithm, "ML Regressor"),
+        "mode":                 mode,
+        "train_size":           len(train),
+        "test_size":            len(test),
+        "metrics":              {"MAE": mae, "RMSE": rmse, "R2": r2},
+        "test_results_df":      test_results_df,
         "feature_importance_df": feature_importance_df,
         "prediction": {
-            "last_date": last_trading_date,
-            "current_close": current_close,
-            "predicted_next_close": predicted_next_close,
-            "expected_change_abs": expected_change_abs,
-            "expected_change_pct": expected_change_pct,
+            "last_date":           last_date,
+            "current_close":       current_close,
+            "predicted_next_close": predicted_price,
+            "expected_change_abs": change_abs,
+            "expected_change_pct": change_pct,
         },
     }

@@ -1,131 +1,106 @@
-"""
-preprocessing.py - Data Cleaning and Feature Engineering Module
-Performs data sanitation, robust verification, rolling-window calculations,
-and both nominal and stationary feature engineering for stock price prediction.
-"""
+# preprocessing.py - Clean data and create features for the ML model
 
-from typing import Dict, Tuple, List
 import numpy as np
 import pandas as pd
 
-# Nominal features (Baseline mode)
-NOMINAL_FEATURE_COLUMNS: List[str] = [
-    "Previous_Close",
-    "Daily_Return",
-    "MA_5",
-    "MA_20",
-    "High_Low_Range",
-    "Volume_Change",
-    "Volatility",
+# Features used when predicting raw price (Nominal mode)
+NOMINAL_FEATURE_COLUMNS = [
+    "Previous_Close",   # yesterday's closing price
+    "Daily_Return",     # % change from yesterday to today
+    "MA_5",             # average close over last 5 days
+    "MA_20",            # average close over last 20 days
+    "High_Low_Range",   # today's high minus today's low
+    "Volume_Change",    # % change in trading volume
+    "Volatility",       # how much returns varied over last 10 days
 ]
 
-# Stationary scale-invariant features (Advanced mode)
-STATIONARY_FEATURE_COLUMNS: List[str] = [
-    "Daily_Return",
-    "Ratio_MA5",
-    "Ratio_MA20",
-    "Rel_High_Low",
-    "Volume_Change",
-    "Volatility",
+# Features used when predicting % return (Stationary mode — more robust)
+STATIONARY_FEATURE_COLUMNS = [
+    "Daily_Return",     # % change today
+    "Ratio_MA5",        # MA_5 divided by Close (scale-free)
+    "Ratio_MA20",       # MA_20 divided by Close (scale-free)
+    "Rel_High_Low",     # High-Low range divided by Close (scale-free)
+    "Volume_Change",    # % change in volume
+    "Volatility",       # 10-day rolling std of returns
 ]
 
-# Alias for backwards compatibility
-FEATURE_COLUMNS: List[str] = NOMINAL_FEATURE_COLUMNS
+# Alias so app.py can import FEATURE_COLUMNS without breaking
+FEATURE_COLUMNS = NOMINAL_FEATURE_COLUMNS
 
-TARGET_PRICE_COLUMN: str = "Target"
-TARGET_RETURN_COLUMN: str = "Target_Return"
+TARGET_PRICE_COLUMN  = "Target"         # next day's closing price
+TARGET_RETURN_COLUMN = "Target_Return"  # next day's % return
 
 
-def preprocess_and_engineer_features(
-    raw_df: pd.DataFrame,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, int]]:
+def preprocess_and_engineer_features(raw_df):
     """
-    Cleans raw OHLCV stock data, computes financial technical features
-    (both raw nominal indicators and stationary scale-invariant ratios),
-    and structures training/unseen prediction splits.
-
-    Parameters:
-        raw_df (pd.DataFrame): Raw historical dataframe with OHLCV columns.
+    Step 1 — Clean the raw data.
+    Step 2 — Build 7 technical features from OHLCV columns.
+    Step 3 — Create the target (what we want to predict).
+    Step 4 — Split into training data and the latest row for prediction.
 
     Returns:
-        Tuple:
-            - full_df (pd.DataFrame): Entire dataframe with calculated features.
-            - model_df (pd.DataFrame): Clean historical dataset with target for ML.
-            - latest_features (pd.DataFrame): Latest single row for next trading day prediction.
-            - audit_stats (dict): Dictionary of preprocessing audit metrics.
+        full_df        — all rows with features (used for charts)
+        model_df       — rows where both features AND target exist (used for training)
+        latest_row     — the most recent row (used to predict tomorrow)
+        audit_stats    — a small summary of what was cleaned
     """
     df = raw_df.copy()
-
-    # 1. Verification and Sorting
     df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
-    df = df.sort_values("Date", ascending=True).reset_index(drop=True)
+    df = df.sort_values("Date").drop_duplicates(subset="Date", keep="last").reset_index(drop=True)
 
     initial_rows = len(df)
 
-    # 2. Duplicate Detection and Removal
-    duplicates_count = int(df.duplicated(subset=["Date"]).sum())
-    if duplicates_count > 0:
-        df = df.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+    # --- Step 1: Remove bad rows ---
+    # Drop rows where Close is zero/negative or High is less than Low (impossible)
+    bad_rows = (df["Close"] <= 0) | (df["High"] < df["Low"])
+    df = df[~bad_rows].reset_index(drop=True)
+    invalid_removed = int(bad_rows.sum())
 
-    # 3. Invalid-value checking
-    invalid_mask = (df["Close"] <= 0) | (df["High"] < df["Low"])
-    invalid_rows_count = int(invalid_mask.sum())
-    if invalid_rows_count > 0:
-        df = df[~invalid_mask].reset_index(drop=True)
-
-    # Handle zero or missing volume to prevent division by zero in pct_change
+    # Replace zero volume with NaN then forward-fill
+    # (zero volume causes division-by-zero when computing Volume_Change)
     df["Volume"] = df["Volume"].replace(0, np.nan).ffill().bfill()
 
-    # 4. Feature Engineering
-    # (a) Previous Close & Daily Return
-    df["Previous_Close"] = df["Close"].shift(1)
-    df["Daily_Return"] = (df["Close"] / df["Previous_Close"]) - 1
+    # --- Step 2: Build features ---
+    df["Previous_Close"]  = df["Close"].shift(1)
+    df["Daily_Return"]    = df["Close"].pct_change()                        # (Close_t - Close_{t-1}) / Close_{t-1}
+    df["MA_5"]            = df["Close"].rolling(5).mean()
+    df["MA_20"]           = df["Close"].rolling(20).mean()
+    df["High_Low_Range"]  = df["High"] - df["Low"]
+    df["Volume_Change"]   = df["Volume"].pct_change()
+    df["Volatility"]      = df["Daily_Return"].rolling(10).std()
 
-    # (b) Moving Averages
-    df["MA_5"] = df["Close"].rolling(window=5).mean()
-    df["MA_20"] = df["Close"].rolling(window=20).mean()
+    # Scale-free versions (divide by Close so price level doesn't matter)
+    df["Ratio_MA5"]       = df["MA_5"]  / df["Close"]
+    df["Ratio_MA20"]      = df["MA_20"] / df["Close"]
+    df["Rel_High_Low"]    = df["High_Low_Range"] / df["Close"]
 
-    # (c) High-Low Range
-    df["High_Low_Range"] = df["High"] - df["Low"]
+    # --- Step 3: Create targets ---
+    df["Target"]          = df["Close"].shift(-1)                           # next day's price
+    df["Target_Return"]   = df["Target"] / df["Close"] - 1                 # next day's % return
 
-    # (d) Volume Change
-    df["Volume_Change"] = df["Volume"].pct_change()
-
-    # (e) Historical Volatility (10-day rolling std of returns)
-    df["Volatility"] = df["Daily_Return"].rolling(window=10).std()
-
-    # (f) Stationary Scale-Invariant Ratios (Relative to current Close)
-    # Eliminates non-stationarity and extrapolation barrier for tree models
-    df["Ratio_MA5"] = df["MA_5"] / df["Close"]
-    df["Ratio_MA20"] = df["MA_20"] / df["Close"]
-    df["Rel_High_Low"] = df["High_Low_Range"] / df["Close"]
-
-    # (g) Targets
-    # Nominal price target
-    df["Target"] = df["Close"].shift(-1)
-    # Stationary percentage return target
-    df["Target_Return"] = (df["Close"].shift(-1) - df["Close"]) / df["Close"]
-
-    # 5. Clean up infinities and rolling window warm-up NaNs
+    # Replace any infinity values (e.g. from dividing by zero) with NaN
     df = df.replace([np.inf, -np.inf], np.nan)
 
+    # --- Step 4: Split rows ---
     all_features = list(set(NOMINAL_FEATURE_COLUMNS + STATIONARY_FEATURE_COLUMNS))
 
-    # Extract latest row (has all features computed, but tomorrow target is NaN)
-    valid_features_mask = df[all_features].notna().all(axis=1)
-    latest_features = df[valid_features_mask].iloc[[-1]].copy()
+    # latest_row: the last row that has all features computed (target will be NaN — that's fine)
+    has_features = df[all_features].notna().all(axis=1)
+    latest_row = df[has_features].iloc[[-1]].copy()
 
-    # Model training dataset: where both features AND targets are present
-    model_df = df.dropna(subset=all_features + [TARGET_PRICE_COLUMN, TARGET_RETURN_COLUMN]).copy().reset_index(drop=True)
+    # model_df: rows where features AND both targets are all present (used for training)
+    model_df = df.dropna(
+        subset=all_features + [TARGET_PRICE_COLUMN, TARGET_RETURN_COLUMN]
+    ).reset_index(drop=True)
 
     audit_stats = {
-        "initial_rows": initial_rows,
-        "duplicates_removed": duplicates_count,
-        "invalid_rows_removed": invalid_rows_count,
-        "nominal_features": len(NOMINAL_FEATURE_COLUMNS),
-        "stationary_features": len(STATIONARY_FEATURE_COLUMNS),
+        "initial_rows":        initial_rows,
+        "duplicates_removed":  initial_rows - len(df) - invalid_removed,
+        "invalid_rows_removed": invalid_removed,
         "usable_training_rows": len(model_df),
         "warmup_rows_dropped": initial_rows - len(model_df) - 1,
+        "nominal_features":    len(NOMINAL_FEATURE_COLUMNS),
+        "stationary_features": len(STATIONARY_FEATURE_COLUMNS),
     }
 
-    return df, model_df, latest_features, audit_stats
+    return df, model_df, latest_row, audit_stats

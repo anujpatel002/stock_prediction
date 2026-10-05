@@ -1,96 +1,57 @@
-"""
-data.py - Real Historical Stock Market Data Ingestion
-Module for fetching dynamic daily OHLCV data from Yahoo Finance via yfinance.
-"""
+# data.py - Download stock price data from Yahoo Finance
 
-from typing import Dict, Optional
 import pandas as pd
 import yfinance as yf
 
-# Predefined list of benchmark Indian NSE stocks for the case study
-POPULAR_STOCKS: Dict[str, str] = {
-    "Reliance Industries": "RELIANCE.NS",
-    "Tata Consultancy Services (TCS)": "TCS.NS",
-    "Infosys Limited (INFY)": "INFY.NS",
-    "HDFC Bank Limited": "HDFCBANK.NS",
-    "ICICI Bank Limited": "ICICIBANK.NS",
+# Popular Indian NSE stocks shown in the dropdown
+POPULAR_STOCKS = {
+    "Reliance Industries":           "RELIANCE.NS",
+    "Tata Consultancy Services":     "TCS.NS",
+    "Infosys":                       "INFY.NS",
+    "HDFC Bank":                     "HDFCBANK.NS",
+    "ICICI Bank":                    "ICICIBANK.NS",
 }
-
-AVAILABLE_PERIODS = ["1y", "2y", "5y"]
 
 
 def load_stock_data(ticker: str, period: str = "5y") -> pd.DataFrame:
     """
-    Dynamically downloads daily historical OHLCV data for a given ticker from Yahoo Finance.
+    Download daily OHLCV data for a stock from Yahoo Finance.
 
-    Parameters:
-        ticker (str): Ticker symbol (e.g., 'RELIANCE.NS', 'TCS.NS')
-        period (str): Historical data horizon ('1y', '2y', '5y')
-
-    Returns:
-        pd.DataFrame: Cleaned dataframe containing ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+    ticker : stock symbol, e.g. 'RELIANCE.NS'
+    period : how far back to go — '1y', '2y', or '5y'
+    Returns a DataFrame with columns: Date, Open, High, Low, Close, Volume
     """
-    ticker_clean = ticker.strip().upper()
-    
-    # Try fetching with user-provided ticker
-    df = yf.download(
-        tickers=ticker_clean,
-        period=period,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-    )
+    ticker = ticker.strip().upper()
 
-    # If empty and ticker lacks exchange suffix (e.g. INDOMIM), automatically try .NS or .BO
-    if (df is None or df.empty) and ("." not in ticker_clean):
-        for fallback_suffix in [".NS", ".BO"]:
-            fallback_ticker = f"{ticker_clean}{fallback_suffix}"
-            df_fallback = yf.download(
-                tickers=fallback_ticker,
-                period=period,
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-            )
-            if df_fallback is not None and not df_fallback.empty:
-                df = df_fallback
-                ticker_clean = fallback_ticker
-                break
+    df = yf.download(ticker, period=period, interval="1d",
+                     auto_adjust=True, progress=False)
 
-    if df is None or df.empty:
+    # If nothing came back, try adding .NS (Indian exchange) automatically
+    if df.empty and "." not in ticker:
+        df = yf.download(ticker + ".NS", period=period, interval="1d",
+                         auto_adjust=True, progress=False)
+
+    if df.empty:
         raise ValueError(
-            f"No historical data could be retrieved for ticker '{ticker_clean}'. "
-            "For Indian stocks, ensure the exchange suffix is included (e.g., 'INDOMIM.NS' or 'RELIANCE.NS')."
+            f"No data found for '{ticker}'. "
+            "Check the ticker symbol (e.g. RELIANCE.NS) and your internet connection."
         )
 
-    # Flatten MultiIndex columns created by recent yfinance releases
+    # Newer yfinance returns multi-level columns like (Close, RELIANCE.NS) — flatten them
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # Reset index to turn Date into an explicit column
     df = df.reset_index()
 
-    # Ensure Date column exists and is timezone-naive datetime
-    date_col = next((c for c in df.columns if str(c).lower() == "date"), None)
-    if date_col is None:
-        raise ValueError("Downloaded dataset does not contain a 'Date' index or column.")
-
-    if date_col != "Date":
-        df = df.rename(columns={date_col: "Date"})
-
+    # Make sure the date column is named 'Date' and has no timezone info
+    df = df.rename(columns={df.columns[0]: "Date"})
     df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
 
-    # Required OHLCV columns
-    expected_cols = ["Open", "High", "Low", "Close", "Volume"]
-    for col in expected_cols:
-        if col not in df.columns:
-            raise ValueError(f"Required OHLCV column '{col}' missing from data feed.")
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Keep and arrange standard columns
+    # Keep only the 6 standard columns
     df = df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
 
-    # Sort strictly by Date ascending
-    df = df.sort_values("Date", ascending=True).reset_index(drop=True)
+    # Convert all price/volume columns to numbers (in case any are strings)
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    return df
+    return df.sort_values("Date").reset_index(drop=True)
